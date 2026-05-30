@@ -64,17 +64,20 @@ _custom_nodes_imported = False
 CLIP = None
 VAE = None
 UNET = None
+LORA = None
 
 MODEL_CONFIG = {
-    "clip_name": "Qwen3-4B-Q5_K_M.gguf",
-    "clip_type": "lumina2",
-    "vae_name": "z_image_turbo_vae.safetensors",
-    "unet_name": "z_image_turbo-Q5_K_M.gguf",
+    "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+    "clip_type": "qwen_image",
+    "vae_name": "qwen_image_vae.safetensors",
+    "unet_name": "Qwen-Image-Edit-2509-Q3_K_M.gguf",
+    "lora_name": "Qwen-Image-Lightning-4steps-V1.0.safetensors",
+    "lora_strength": 1,
     "width": 1024,
     "height": 1024,
-    "steps": 8,
+    "steps": 4,
     "cfg": 1,
-    "sampler_name": "res_multistep",
+    "sampler_name": "euler",
     "scheduler": "simple",
     "denoise": 1,
     "filename_prefix": "tryon",
@@ -119,7 +122,7 @@ def import_custom_nodes() -> None:
 
 def _ensure_models_loaded():
     global _models_loaded, _custom_path_added, _custom_nodes_imported
-    global CLIP, VAE, UNET
+    global CLIP, VAE, UNET, LORA
 
     if _models_loaded:
         return
@@ -151,6 +154,28 @@ def _ensure_models_loaded():
 
         unet_loader = NODE_CLASS_MAPPINGS.get("UnetLoaderGGUF", NODE_CLASS_MAPPINGS.get("UnetLoader"))()
         UNET = unet_loader.load_unet(unet_name=MODEL_CONFIG["unet_name"]) if hasattr(unet_loader, "load_unet") else unet_loader
+
+        # Optionally load LoRA into a wrapper if available
+        if "LoraLoaderModelOnly" in NODE_CLASS_MAPPINGS and MODEL_CONFIG.get("lora_name"):
+            try:
+                lora_loader_cls = NODE_CLASS_MAPPINGS["LoraLoaderModelOnly"]
+                lora_loader = lora_loader_cls()
+                if hasattr(lora_loader, "load_lora_model_only"):
+                    LORA = lora_loader.load_lora_model_only(
+                        lora_name=MODEL_CONFIG["lora_name"],
+                        strength_model=MODEL_CONFIG.get("lora_strength", 1),
+                        model=get_value_at_index(UNET, 0),
+                    )
+                elif hasattr(lora_loader, "load_lora"):
+                    LORA = lora_loader.load_lora(lora_name=MODEL_CONFIG["lora_name"], strength_model=MODEL_CONFIG.get("lora_strength", 1), model=get_value_at_index(UNET, 0))
+                elif hasattr(lora_loader, "load"):
+                    LORA = lora_loader.load(lora_name=MODEL_CONFIG["lora_name"], strength_model=MODEL_CONFIG.get("lora_strength", 1), model=get_value_at_index(UNET, 0))
+                else:
+                    raise RuntimeError("LoraLoaderModelOnly node has no supported load method")
+            except Exception:
+                LORA = None
+        else:
+            LORA = None
 
     _models_loaded = True
 
@@ -199,11 +224,19 @@ def generate_tryon_image(
         )
 
         imagescaletototalpixels = NODE_CLASS_MAPPINGS["ImageScaleToTotalPixels"]()
-        scaled = imagescaletototalpixels.EXECUTE_NORMALIZED(
-            upscale_method="lanczos",
-            megapixels=1,
-            image=get_value_at_index(stitched, 0),
-        )
+        try:
+            scaled = imagescaletototalpixels.EXECUTE_NORMALIZED(
+                upscale_method="lanczos",
+                megapixels=1,
+                resolution_steps=1,
+                image=get_value_at_index(stitched, 0),
+            )
+        except TypeError:
+            scaled = imagescaletototalpixels.EXECUTE_NORMALIZED(
+                upscale_method="lanczos",
+                megapixels=1,
+                image=get_value_at_index(stitched, 0),
+            )
 
         vaeencode = NODE_CLASS_MAPPINGS["VAEEncode"]()
         _ = vaeencode.encode(
@@ -216,6 +249,13 @@ def generate_tryon_image(
 
         # Prepare model for sampling (use loaded UNET wrapper)
         model_for_sampling = get_value_at_index(UNET, 0)
+
+        # If a LoRA wrapper was loaded, prefer its output as the sampling model
+        if LORA is not None:
+            try:
+                model_for_sampling = get_value_at_index(LORA, 0)
+            except Exception:
+                model_for_sampling = LORA
 
         # Optional aura + cfgnorm (if nodes exist)
         if "ModelSamplingAuraFlow" in NODE_CLASS_MAPPINGS and "CFGNorm" in NODE_CLASS_MAPPINGS:
